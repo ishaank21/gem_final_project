@@ -20,6 +20,9 @@ import rich
 import cv2
 from scipy.spatial.transform import Rotation as R
 
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+
 
 class LaneVisualizer(Node):
     def __init__(self):
@@ -52,7 +55,7 @@ class LaneVisualizer(Node):
         self._world = WorldGT("HighBay")
         self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
-        
+        self._path_pub = self.create_publisher(Path, "/lane_path", 10)
         self._image_msg = None
         self._cv_bridge = CvBridge()
         
@@ -64,94 +67,103 @@ class LaneVisualizer(Node):
         )
 
     def _on_image(self, msg) -> None:
-            self._image_msg = msg
-            if self._model is None:
-                return
-            
-            # 1. Initialize variables with default values to prevent UnboundLocalError
-            XTE, HE = "N/A", "N/A"
-            lane, gt_XTE, gt_HE = "unknown", "N/A", "N/A"
-            
-            # 2. Convert and crop the stereo image (Taking only the LEFT half for ZED bags)
-            full_image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
-            height, width, _ = full_image.shape
-            image = full_image[:, :width//2, :] 
-            
-            # 3. Perception Pipeline: Run inference to obtain binary mask
-            mask = inference(self._model, image, self._dev)
-            m = mask.astype(np.uint8) * 255
+        self._image_msg = msg
+        if self._model is None:
+            return
+        
+        XTE, HE = "N/A", "N/A"
+        lane, gt_XTE, gt_HE = "unknown", "N/A", "N/A"
+        
+        # 1. DO NOT CROP FOR SIMULATION
+        image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
+        
+        # 2. Perception Pipeline
+        mask = inference(self._model, image, self._dev)
+        m = mask.astype(np.uint8) * 255
 
-            # 4. Noise Filtering: Morphological Operations
-            # Use a kernel to scrub small blobs (Opening) and solidify lane lines (Closing)
-            kernel = np.ones((5, 5), np.uint8)
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+        # 3. Use 50% cut for Simulator (62% is for the Highbay buildings)
+        h_mask = m.shape[0]
+        m[:int(h_mask * 0.50), :] = 0 
+        
+        # 4. Fitting
+        combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
 
-            # 5. Spatial Masking: Horizon and Side-Masks
-            h_mask, w_mask = m.shape[:2]
-            # Horizon: Zero out top 62% to hide buildings and trucks
-            m[:int(h_mask * 0.62), :] = 0 
-            # Side-Masking: Zero out left and right 15% to stop IPM streaking
-            m[:, :int(w_mask * 0.15)] = 0
-            m[:, int(w_mask * 0.85):] = 0
+        # Prepare BEV for drawing
+        binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
+        binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
+        
+        if ret:                
+            poly_px = (np.add(ret["left_fit"], ret["right_fit"]) / 2)
+            est_xte_val, est_he_val, camera_px, closest_px = self.compute_error(poly_px)
             
-            # 6. Lane Fitting and BEV Projection
-            combine_fit_img, binary_BEV, ret = self.fit_poly_lanes(image, m)
+            # --- LANE FOLLOWING: PATH GENERATION ---
+            path_msg = Path()
+            path_msg.header.frame_id = "base_link" # Car's local frame
+            path_msg.header.stamp = self.get_clock().now().to_msg()
 
-            # Prepare BEV for drawing
-            binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
-            binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
-            
-            # 7. Process fit results if lanes were successfully detected
-            if ret:                
-                poly_px = (np.add(ret["left_fit"], ret["right_fit"]) / 2)
-                est_xte_val, est_he_val, camera_px, closest_px = self.compute_error(poly_px)
+            # Get conversion factors from config
+            Sy, Sx = self._bev_cfg["unit_conversion_factor"]
+            bev_img_h, bev_img_w = 600, 800 # Based on your config
+
+            # Sample 10 points along the centerline from bottom to top
+            for y_px in np.linspace(bev_img_h, 0, 10):
+                x_px = np.polyval(poly_px, y_px)
                 
-                # Draw lane lines on the BEV
-                ploty = ret['ploty']
-                left_fitx = np.polyval(ret["left_fit"], ploty)
-                center_fitx = np.polyval(poly_px, ploty)
-                right_fitx = np.polyval(ret["right_fit"], ploty)
-                
-                pts_left = np.stack((left_fitx, ploty), axis=1).astype(np.int32)
-                pts_center = np.stack((center_fitx, ploty), axis=1).astype(np.int32)
-                pts_right = np.stack((right_fitx, ploty), axis=1).astype(np.int32)
+                # Transform to car frame (meters)
+                # x is forward, y is left
+                x_m = (bev_img_h - y_px) * Sy
+                y_m = -(x_px - (bev_img_w / 2)) * Sx
 
-                cv2.polylines(binary_BEV, [pts_center], isClosed=False, color=(0, 255, 255), thickness=4)                
-                cv2.polylines(binary_BEV, [pts_left], isClosed=False, color=(255, 0, 0), thickness=4)
-                cv2.polylines(binary_BEV, [pts_right], isClosed=False, color=(0, 0, 255), thickness=4)
+                pose = PoseStamped()
+                pose.pose.position.x = float(x_m)
+                pose.pose.position.y = float(y_m)
+                path_msg.poses.append(pose)
+            
+            self._path_pub.publish(path_msg)
+            
+            # Drawing logic
+            ploty = ret['ploty']
+            left_fitx = np.polyval(ret["left_fit"], ploty)
+            center_fitx = np.polyval(poly_px, ploty)
+            right_fitx = np.polyval(ret["right_fit"], ploty)
+            
+            pts_left = np.stack((left_fitx, ploty), axis=1).astype(np.int32)
+            pts_center = np.stack((center_fitx, ploty), axis=1).astype(np.int32)
+            pts_right = np.stack((right_fitx, ploty), axis=1).astype(np.int32)
 
-                # Draw XTE/HE visualization markers
-                cv2.circle(binary_BEV, (int(closest_px[0]), int(closest_px[1])), 8, (0, 255, 0), -1)
-                cv2.line(binary_BEV, (int(camera_px[0]), int(camera_px[1])), (int(closest_px[0]), int(closest_px[1])), (0, 255, 0), 4)
+            cv2.polylines(binary_BEV, [pts_center], isClosed=False, color=(0, 255, 255), thickness=4)                
+            cv2.polylines(binary_BEV, [pts_left], isClosed=False, color=(255, 0, 0), thickness=4)
+            cv2.polylines(binary_BEV, [pts_right], isClosed=False, color=(0, 0, 255), thickness=4)
 
-                # Format outputs for terminal display
-                XTE = f"{est_xte_val:.2f}"
-                HE = f"{np.degrees(est_he_val):.2f}"
+            cv2.circle(binary_BEV, (int(closest_px[0]), int(closest_px[1])), 8, (0, 255, 0), -1)
+            cv2.line(binary_BEV, (int(camera_px[0]), int(camera_px[1])), (int(closest_px[0]), int(closest_px[1])), (0, 255, 0), 4)
 
-            # 8. Attempt Ground Truth (GT) lookup from TF tree
-            try:
-                trans = self._tf_buf.lookup_transform("highbay", "stereo_camera_link", msg.header.stamp)
-                pos = trans.transform.translation
-                q = trans.transform.rotation
-                rotation = R.from_quat([q.x, q.y, q.z, q.w])
-                yaw = rotation.as_euler('xyz', degrees=False)[2]
-                lane, _, gt_xte_val, gt_he_val = self._world.get_metrics(pos.x, pos.y, yaw)
-                gt_XTE = f"{gt_xte_val:.2f}"
-                gt_HE = f"{np.degrees(gt_he_val):.2f}"
-            except:
-                pass # Keep default "N/A" values set at the top
-                
-            # 9. Visualization and Console Log
-            print(f"EST XTE: {XTE} m - HE: {HE}° -- GT XTE: {gt_XTE} m HE: {gt_HE}° - lane: {lane}")
+            XTE = f"{est_xte_val:.2f}"
+            HE = f"{np.degrees(est_he_val):.2f}"
 
-            if combine_fit_img is None:
-                combine_fit_img = image
+        # Ground Truth lookup
+        try:
+            # Note: For Gazebo sim, the frame might be "world" or "map"
+            trans = self._tf_buf.lookup_transform("world", "base_link", msg.header.stamp)
+            pos = trans.transform.translation
+            rotation = R.from_quat([trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z, trans.transform.rotation.w])
+            yaw = rotation.as_euler('xyz', degrees=False)[2]
+            lane_id, _, gt_xte_val, gt_he_val = self._world.get_metrics(pos.x, pos.y, yaw)
+            gt_XTE = f"{gt_xte_val:.2f}"
+            gt_HE = f"{np.degrees(gt_he_val):.2f}"
+            lane = lane_id
+        except:
+            pass
+            
+        print(f"EST XTE: {XTE} m - HE: {HE}° -- GT XTE: {gt_XTE} m HE: {gt_HE}° - lane: {lane}")
 
-            cv2.imshow("render_view", combine_fit_img)
-            cv2.imshow("binary_BEV", binary_BEV)
-            cv2.waitKey(1)
-    
+        if combine_fit_img is None:
+            combine_fit_img = image
+
+        cv2.imshow("render_view", combine_fit_img)
+        cv2.imshow("binary_BEV", binary_BEV)
+        cv2.waitKey(1)
+        
     # def _on_image(self, msg) -> None:
     #     self._image_msg = msg
     #     if self._model is None:

@@ -77,38 +77,27 @@ import json
 import numpy as np
 
 def main():
-    # 1. Intrinsics (K) adjusted for 640x360 resolution
-    # cx is 320 (half of 640), cy is 180 (half of 360)
-    # Focal length (476.7) is scaled down from the sim resolution
+    # 1. Simulator Intrinsics (Original 800x600 values)
     K = np.array([
-        [476.7 * (640/800), 0.0, 320.0],
-        [0.0, 476.7 * (360/600), 180.0],
+        [476.7030836014194, 0.0, 400.0],
+        [0.0, 476.7030836014194, 300.0],
         [0.0, 0.0, 1.0]
     ])
     
-    # 2. Extrinsics (R,t) - Using your measured/sim values
-    R = np.array([
-        [0, -1, 0],
-        [ 0, 0, 1],
-        [ -1, 0, 0]
-    ])
+    # 2. Simulator Extrinsics
+    R = np.array([[0, -1, 0], [0, 0, 1], [-1, 0, 0]])
     t = np.array([0.160, -0.110, 1.546])
 
-    # 3. BEV Rectangle Hyperparameters (in meters)
-    # Focus on the road 2m to 10m in front of the car
-    bev_height = 8.0   
-    bev_width = 6.0    
-    bev_margin = 2.0   
-
+    # 3. Simulator Dimensions (Reverting to 15x20 for the wide sim track)
+    bev_height, bev_width = 15.0, 20.0
     bev_img_height, bev_img_width = 600, 800
     unit_conversion_factor = (bev_height/bev_img_height, bev_width/bev_img_width)
     
-    # Corners of the ground plane rectangle
     bev_world_coords = np.float32([
-        [bev_height + bev_margin, -bev_width/2, 0], # Top Left
-        [bev_margin, -bev_width/2, 0],              # Bottom Left
-        [bev_margin, bev_width/2, 0],               # Bottom Right
-        [bev_height + bev_margin, bev_width/2, 0],  # Top Right
+        [bev_height, -bev_width/2, 0],
+        [0, -bev_width/2, 0],
+        [0, bev_width/2, 0],
+        [bev_height, bev_width/2, 0],
     ])
 
     src = []
