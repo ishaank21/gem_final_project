@@ -1,5 +1,5 @@
 import os
-
+import math 
 import torch
 import json
 import numpy as np
@@ -22,6 +22,7 @@ from scipy.spatial.transform import Rotation as R
 
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
+from ackermann_msgs.msg import AckermannDrive
 
 
 class LaneVisualizer(Node):
@@ -65,6 +66,37 @@ class LaneVisualizer(Node):
             self._on_image,
             10
         )
+        self._control_pub = self.create_publisher(AckermannDrive, "/ackermann_cmd", 1)
+        self.L = 1.75
+
+    def stanley_lateral_controller(self, current_he, current_xte, current_speed):
+        """
+        Calculates steering based on Heading Error and Cross-Track Error.
+        """
+        k = 1.0 # Control Gain. Increase if it's sluggish, decrease if it oscillates.
+        
+        # Prevent division by zero if speed is 0
+        v = max(current_speed, 0.1) 
+        
+        # Stanley formula
+        steering = current_he + math.atan2(k * current_xte, v)
+        
+        # Clip steering to GEM e2 limits (roughly +/- 0.8 rad)
+        steering = np.clip(steering, -0.8, 0.8)
+        
+        return steering
+
+    def longitudinal_controller(self, current_he):
+        """
+        Slow, safe speeds for testing in the Highbay and Sim.
+        """
+        straight_speed = 3.0 # Significantly reduced from 12.0
+        corner_speed = 1.5   # Significantly reduced from 8.0
+
+        if abs(current_he) > 0.1: # Increased threshold to ~5.7 degrees
+            return corner_speed
+        else:
+            return straight_speed
 
     def _on_image(self, msg) -> None:
         self._image_msg = msg
@@ -96,31 +128,16 @@ class LaneVisualizer(Node):
             poly_px = (np.add(ret["left_fit"], ret["right_fit"]) / 2)
             est_xte_val, est_he_val, camera_px, closest_px = self.compute_error(poly_px)
             
-            # --- LANE FOLLOWING: PATH GENERATION ---
-            path_msg = Path()
-            path_msg.header.frame_id = "base_link" # Car's local frame
-            path_msg.header.stamp = self.get_clock().now().to_msg()
+            # --- CALCULATE CONTROL COMMANDS (Stanley) ---
+            target_speed = self.longitudinal_controller(est_he_val)
+            target_steering = self.stanley_lateral_controller(est_he_val, est_xte_val, target_speed)
 
-            # Get conversion factors from config
-            Sy, Sx = self._bev_cfg["unit_conversion_factor"]
-            bev_img_h, bev_img_w = 600, 800 # Based on your config
-
-            # Sample 10 points along the centerline from bottom to top
-            for y_px in np.linspace(bev_img_h, 0, 10):
-                x_px = np.polyval(poly_px, y_px)
-                
-                # Transform to car frame (meters)
-                # x is forward, y is left
-                x_m = (bev_img_h - y_px) * Sy
-                y_m = -(x_px - (bev_img_w / 2)) * Sx
-
-                pose = PoseStamped()
-                pose.pose.position.x = float(x_m)
-                pose.pose.position.y = float(y_m)
-                path_msg.poses.append(pose)
-            
-            self._path_pub.publish(path_msg)
-            
+            # --- PUBLISH TO GEM CAR ---
+            cmd = AckermannDrive()
+            cmd.speed = float(target_speed)
+            cmd.steering_angle = float(target_steering)
+            self._control_pub.publish(cmd)
+                        
             # Drawing logic
             ploty = ret['ploty']
             left_fitx = np.polyval(ret["left_fit"], ploty)
