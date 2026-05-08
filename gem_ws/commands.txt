@@ -1,0 +1,12 @@
+### IMPORTANT TOPICS 
+
+front stereo camera: /zed/zed_node/stereo/image_rect_color
+
+corner cameras: /lucid_vision
+
+LiDAR: /ouster/range_image
+
+GNSS: /motion_image
+
+IMU: /zed/zed_node/imu
+
