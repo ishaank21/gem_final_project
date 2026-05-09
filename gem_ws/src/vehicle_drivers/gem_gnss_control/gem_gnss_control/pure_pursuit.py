@@ -89,7 +89,7 @@ class PurePursuit(Node):
         # Declare parameters with default values
         self.declare_parameter('rate_hz', 20)
         self.declare_parameter('look_ahead', 5.0)
-        self.declare_parameter('wheelbase', 2.57)
+        self.declare_parameter('wheelbase', 1.75)
         self.declare_parameter('offset', 1.26)
         self.declare_parameter('origin_lat', 40.0927422)
         self.declare_parameter('origin_lon', -88.2359639)

@@ -28,7 +28,7 @@ class LaneFollow(Node):
         self.declare_parameter('data_dir', '/home/gem/ABO_WS/lane_follow_controller')
         self.declare_parameter('target_speed', 2.0)
         self.declare_parameter('image_topic', '/zed/zed_node/rgb/image_rect_color')
-        self.declare_parameter('wheelbase', 2.57)
+        self.declare_parameter('wheelbase', 1.75)
 
         data_dir      = self.get_parameter('data_dir').value
         self._target_speed = self.get_parameter('target_speed').value
